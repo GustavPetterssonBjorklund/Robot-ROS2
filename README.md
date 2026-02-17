@@ -21,6 +21,22 @@ Create and activate a Python virtual environment, then install:
 pip install -r requirements.txt
 ```
 
+### Nix shell (recommended on NixOS/remote)
+This repo includes `shell.nix` with:
+- `ollama`
+- Whisper binary (`whisper-cli` via `whisper-cpp`, or `whisper`)
+- audio libs (`portaudio`, `libsndfile`)
+
+Enter shell:
+```bash
+nix-shell
+```
+
+Then install Python deps:
+```bash
+pip install -r requirements.txt
+```
+
 Copy env template:
 ```bash
 copy .env.example .env
