@@ -1,6 +1,8 @@
 import asyncio
 import os
+import shlex
 import tempfile
+from collections import deque
 from pathlib import Path
 
 from aiohttp import web
@@ -18,6 +20,8 @@ WHISPER_COMMAND = os.getenv(
 )
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "You are a concise assistant.")
+CONTEXT_WINDOW_TURNS = int(os.getenv("CONTEXT_WINDOW_TURNS", "6"))
+DEFAULT_SESSION_ID = os.getenv("DEFAULT_SESSION_ID", "default")
 
 
 async def run_cmd(command: str) -> tuple[int, str, str]:
@@ -55,10 +59,15 @@ async def transcribe(audio_path: Path, workdir: Path) -> str:
     return txt_path.read_text(encoding="utf-8").strip()
 
 
-async def run_llm(user_text: str) -> str:
-    prompt = f"{SYSTEM_PROMPT}\n\nUser: {user_text}\nAssistant:"
-    escaped_prompt = prompt.replace('"', '\\"')
-    cmd = f'ollama run {OLLAMA_MODEL} "{escaped_prompt}"'
+async def run_llm(history: list[tuple[str, str]], user_text: str) -> str:
+    prompt_lines = [SYSTEM_PROMPT, ""]
+    for old_user, old_assistant in history:
+        prompt_lines.append(f"User: {old_user}")
+        prompt_lines.append(f"Assistant: {old_assistant}")
+    prompt_lines.append(f"User: {user_text}")
+    prompt_lines.append("Assistant:")
+    prompt = "\n".join(prompt_lines)
+    cmd = f"ollama run {shlex.quote(OLLAMA_MODEL)} {shlex.quote(prompt)}"
     code, out, err = await run_cmd(cmd)
     if code != 0:
         raise RuntimeError(f"llm failed: {err.strip()}")
@@ -67,31 +76,52 @@ async def run_llm(user_text: str) -> str:
 
 async def chat_handler(request: web.Request) -> web.Response:
     reader = await request.multipart()
-    part = await reader.next()
-    if part is None or part.name != "audio":
+    session_id = DEFAULT_SESSION_ID
+    audio_bytes = b""
+
+    while True:
+        part = await reader.next()
+        if part is None:
+            break
+        if part.name == "session_id":
+            session_id = (await part.text()).strip() or DEFAULT_SESSION_ID
+        elif part.name == "audio":
+            chunks = []
+            while True:
+                chunk = await part.read_chunk()
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            audio_bytes = b"".join(chunks)
+
+    if not audio_bytes:
         return web.json_response({"error": "missing 'audio' file field"}, status=400)
 
     with tempfile.TemporaryDirectory() as td:
         workdir = Path(td)
         audio_path = workdir / "input.wav"
         with audio_path.open("wb") as f:
-            while True:
-                chunk = await part.read_chunk()
-                if not chunk:
-                    break
-                f.write(chunk)
+            f.write(audio_bytes)
 
         try:
             transcript = await transcribe(audio_path, workdir)
-            response_text = await run_llm(transcript)
+            histories: dict[str, deque[tuple[str, str]]] = request.app["histories"]
+            history = histories.setdefault(
+                session_id, deque(maxlen=max(1, CONTEXT_WINDOW_TURNS))
+            )
+            response_text = await run_llm(list(history), transcript)
+            history.append((transcript, response_text))
         except Exception as exc:
             return web.json_response({"error": str(exc)}, status=500)
 
-        return web.json_response({"transcript": transcript, "response": response_text})
+        return web.json_response(
+            {"transcript": transcript, "response": response_text, "session_id": session_id}
+        )
 
 
 def main() -> None:
     app = web.Application(client_max_size=10 * 1024 * 1024)
+    app["histories"] = {}
     app.router.add_post("/chat", chat_handler)
     web.run_app(app, host=API_HOST, port=API_PORT)
 

@@ -8,10 +8,13 @@ Simple voice-to-text + remote LLM text response demo, with your own async API.
 3. The server runs:
 - STT using `whisper-cli` (or equivalent command you configure).
 - LLM response using `ollama run` (or equivalent command you configure).
+- Per-session context memory with a configurable context window.
 4. `app.py` runs on your local machine:
-- records microphone audio
-- sends audio to the remote API
+- continuously listens to microphone input
+- auto-detects speech/silence
+- sends each utterance to the remote API
 - prints transcript + LLM response
+- plays the LLM response with TTS
 
 No external hosted API is required.
 
@@ -70,11 +73,26 @@ Configure `.env` (client section), then run locally:
 python app.py
 ```
 
-Press Enter to record, or type `q` to quit.
+The client runs in continuous realtime mode (Ctrl+C to stop).
+
+Useful client tuning env vars:
+- `REALTIME_RMS_THRESHOLD`: mic sensitivity threshold (raise for noisy rooms).
+- `REALTIME_SILENCE_SECONDS`: silence required before sending an utterance.
+- `REALTIME_MIN_SPEECH_SECONDS`: minimum speech duration to accept an utterance.
+- `REALTIME_BLOCK_MS`: capture block size in ms.
+- `SESSION_ID`: conversation id used for server-side context memory.
+- `TTS_ENABLED`: enable/disable response speech.
+- `TTS_RATE`: text-to-speech speaking rate.
+- `TTS_VOICE_HINT`: optional substring to pick a voice by id/name.
+
+Useful server context env vars:
+- `CONTEXT_WINDOW_TURNS`: number of previous user/assistant turns kept per session.
+- `DEFAULT_SESSION_ID`: fallback session id when the client does not provide one.
 
 ## API contract
 `POST /chat` (multipart):
 - file field: `audio` (WAV)
+- text field: `session_id` (optional, defaults to `DEFAULT_SESSION_ID`)
 
 Response JSON:
 ```json
