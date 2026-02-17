@@ -82,6 +82,7 @@ Useful client tuning env vars:
 - `REALTIME_SILENCE_SECONDS`: silence required before sending an utterance.
 - `REALTIME_MIN_SPEECH_SECONDS`: minimum speech duration to accept an utterance.
 - `REALTIME_BLOCK_MS`: capture block size in ms.
+- `REALTIME_MAX_UTTERANCE_SECONDS`: force-close an utterance if silence is never detected.
 - `REMOTE_STREAM_API_URL`: streaming endpoint (SSE).
 - `SESSION_ID`: conversation id used for server-side context memory.
 - `TTS_ENABLED`: enable/disable response speech.
@@ -91,6 +92,7 @@ Useful client tuning env vars:
 Useful server context env vars:
 - `CONTEXT_WINDOW_TURNS`: number of previous user/assistant turns kept per session.
 - `DEFAULT_SESSION_ID`: fallback session id when the client does not provide one.
+- `OLLAMA_API_URL`: local Ollama server URL (default `http://127.0.0.1:11434`).
 
 ## API contract
 `POST /chat` (multipart):

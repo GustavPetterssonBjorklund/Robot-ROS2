@@ -1,12 +1,11 @@
 import asyncio
 import json
 import os
-import shlex
 import tempfile
 from collections import deque
 from pathlib import Path
 
-from aiohttp import web
+from aiohttp import ClientSession, web
 from dotenv import load_dotenv
 
 
@@ -20,6 +19,7 @@ WHISPER_COMMAND = os.getenv(
     'whisper-cli -m "{whisper_model_path}" -f "{audio_path}" -otxt -of "{out_prefix}"',
 )
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
+OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", "http://127.0.0.1:11434")
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "You are a concise assistant.")
 CONTEXT_WINDOW_TURNS = int(os.getenv("CONTEXT_WINDOW_TURNS", "6"))
 DEFAULT_SESSION_ID = os.getenv("DEFAULT_SESSION_ID", "default")
@@ -74,36 +74,42 @@ async def transcribe(audio_path: Path, workdir: Path) -> str:
 
 
 async def run_llm_once(prompt: str) -> str:
-    cmd = f"ollama run {shlex.quote(OLLAMA_MODEL)} {shlex.quote(prompt)}"
-    code, out, err = await run_cmd(cmd)
-    if code != 0:
-        raise RuntimeError(f"llm failed: {err.strip()}")
-    return out.strip()
+    url = f"{OLLAMA_API_URL.rstrip('/')}/api/generate"
+    payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False}
+    async with ClientSession() as session:
+        async with session.post(url, json=payload) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise RuntimeError(f"llm failed with {resp.status}: {text}")
+            data = await resp.json()
+    if data.get("error"):
+        raise RuntimeError(f"llm failed: {data['error']}")
+    return str(data.get("response", "")).strip()
 
 
 async def run_llm_stream(prompt: str):
-    proc = await asyncio.create_subprocess_exec(
-        "ollama",
-        "run",
-        OLLAMA_MODEL,
-        prompt,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    assert proc.stdout is not None
-    assert proc.stderr is not None
-
-    while True:
-        chunk = await proc.stdout.read(64)
-        if not chunk:
-            break
-        yield chunk.decode("utf-8", errors="ignore")
-
-    stderr_bytes = await proc.stderr.read()
-    return_code = await proc.wait()
-    if return_code != 0:
-        err = stderr_bytes.decode("utf-8", errors="ignore").strip()
-        raise RuntimeError(f"llm failed: {err}")
+    url = f"{OLLAMA_API_URL.rstrip('/')}/api/generate"
+    payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": True}
+    async with ClientSession() as session:
+        async with session.post(url, json=payload) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise RuntimeError(f"llm failed with {resp.status}: {text}")
+            async for raw_line in resp.content:
+                line = raw_line.decode("utf-8", errors="ignore").strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if data.get("error"):
+                    raise RuntimeError(f"llm failed: {data['error']}")
+                token = str(data.get("response", ""))
+                if token:
+                    yield token
+                if data.get("done"):
+                    break
 
 
 async def parse_audio_request(request: web.Request) -> tuple[str, bytes]:

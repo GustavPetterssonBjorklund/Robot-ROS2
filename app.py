@@ -1,10 +1,10 @@
 import asyncio
-import audioop
 import io
 import json
 import os
 import queue
 import wave
+from array import array
 from collections import deque
 
 import aiohttp
@@ -26,6 +26,7 @@ RMS_THRESHOLD = int(os.getenv("REALTIME_RMS_THRESHOLD", "450"))
 MIN_SPEECH_SECONDS = float(os.getenv("REALTIME_MIN_SPEECH_SECONDS", "0.35"))
 SILENCE_SECONDS = float(os.getenv("REALTIME_SILENCE_SECONDS", "0.8"))
 PRE_ROLL_SECONDS = float(os.getenv("REALTIME_PRE_ROLL_SECONDS", "0.2"))
+MAX_UTTERANCE_SECONDS = float(os.getenv("REALTIME_MAX_UTTERANCE_SECONDS", "12.0"))
 TTS_ENABLED = os.getenv("TTS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 TTS_RATE = int(os.getenv("TTS_RATE", "185"))
 TTS_VOICE_HINT = os.getenv("TTS_VOICE_HINT", "").strip().lower()
@@ -114,6 +115,19 @@ def pcm_to_wav_bytes(pcm_frames: list[bytes], sample_rate: int) -> bytes:
     return buffer.getvalue()
 
 
+def rms_int16(frame: bytes) -> int:
+    if not frame:
+        return 0
+    samples = array("h")
+    samples.frombytes(frame)
+    if not samples:
+        return 0
+    total = 0.0
+    for s in samples:
+        total += float(s) * float(s)
+    return int((total / len(samples)) ** 0.5)
+
+
 async def main() -> None:
     print(f"Remote stream API: {REMOTE_STREAM_API_URL}")
     print(f"Session ID: {SESSION_ID}")
@@ -124,6 +138,7 @@ async def main() -> None:
     min_speech_blocks = max(1, int(MIN_SPEECH_SECONDS * 1000 / BLOCK_MS))
     silence_blocks_to_end = max(1, int(SILENCE_SECONDS * 1000 / BLOCK_MS))
     pre_roll_blocks = max(0, int(PRE_ROLL_SECONDS * 1000 / BLOCK_MS))
+    max_utterance_blocks = max(1, int(MAX_UTTERANCE_SECONDS * 1000 / BLOCK_MS))
 
     audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=300)
     state = {"paused": False}
@@ -143,13 +158,15 @@ async def main() -> None:
     silence_blocks = 0
     pre_roll: deque[bytes] = deque(maxlen=pre_roll_blocks)
     utterance_frames: list[bytes] = []
+    utterance_blocks = 0
     tts_engine = init_tts_engine()
 
     def reset_utterance_state() -> None:
-        nonlocal in_speech, speech_blocks, silence_blocks, utterance_frames
+        nonlocal in_speech, speech_blocks, silence_blocks, utterance_frames, utterance_blocks
         in_speech = False
         speech_blocks = 0
         silence_blocks = 0
+        utterance_blocks = 0
         pre_roll.clear()
         utterance_frames = []
         while not audio_queue.empty():
@@ -168,7 +185,7 @@ async def main() -> None:
         ):
             while True:
                 frame = await asyncio.to_thread(audio_queue.get)
-                rms = audioop.rms(frame, 2)
+                rms = rms_int16(frame)
                 voiced = rms >= RMS_THRESHOLD
 
                 if not in_speech:
@@ -177,10 +194,12 @@ async def main() -> None:
                         in_speech = True
                         speech_blocks = 1
                         silence_blocks = 0
+                        utterance_blocks = len(pre_roll)
                         utterance_frames = list(pre_roll)
                     continue
 
                 utterance_frames.append(frame)
+                utterance_blocks += 1
                 if voiced:
                     speech_blocks += 1
                     silence_blocks = 0
@@ -189,7 +208,8 @@ async def main() -> None:
 
                 enough_voice = speech_blocks >= min_speech_blocks
                 end_of_utterance = silence_blocks >= silence_blocks_to_end
-                if end_of_utterance:
+                force_end = utterance_blocks >= max_utterance_blocks
+                if end_of_utterance or force_end:
                     if enough_voice:
                         wav_bytes = pcm_to_wav_bytes(utterance_frames, SAMPLE_RATE)
                         state["paused"] = True
