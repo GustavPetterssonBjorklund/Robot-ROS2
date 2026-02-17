@@ -1,400 +1,244 @@
 import asyncio
-import io
 import json
 import os
-import queue
-import re
-import threading
-import time
-import wave
-from array import array
+import tempfile
 from collections import deque
-from typing import Optional
+from pathlib import Path
 
-import aiohttp
-import pyttsx3
-import sounddevice as sd
+from aiohttp import ClientSession, web
 from dotenv import load_dotenv
+
 
 load_dotenv()
 
-# ==========================
-# Config
-# ==========================
-REMOTE_API_URL = os.getenv("REMOTE_API_URL", "http://127.0.0.1:8080/chat")
-REMOTE_STREAM_API_URL = os.getenv("REMOTE_STREAM_API_URL", REMOTE_API_URL.rstrip("/") + "/stream")
-SESSION_ID = os.getenv("SESSION_ID", "default")
-
-SAMPLE_RATE = int(os.getenv("SAMPLE_RATE", "16000"))
-BLOCK_MS = int(os.getenv("REALTIME_BLOCK_MS", "30"))
-RMS_THRESHOLD = int(os.getenv("REALTIME_RMS_THRESHOLD", "450"))
-
-MIN_SPEECH_SECONDS = float(os.getenv("REALTIME_MIN_SPEECH_SECONDS", "0.35"))
-SILENCE_SECONDS = float(os.getenv("REALTIME_SILENCE_SECONDS", "0.8"))
-PRE_ROLL_SECONDS = float(os.getenv("REALTIME_PRE_ROLL_SECONDS", "0.2"))
-MAX_UTTERANCE_SECONDS = float(os.getenv("REALTIME_MAX_UTTERANCE_SECONDS", "12.0"))
-
-TTS_ENABLED = os.getenv("TTS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
-TTS_RATE = int(os.getenv("TTS_RATE", "185"))
-TTS_VOICE_HINT = os.getenv("TTS_VOICE_HINT", "").strip().lower()
-
-# Important: prevents TTS audio from triggering VAD if you’re using speakers.
-DUCK_MIC_WHILE_TTS = os.getenv("DUCK_MIC_WHILE_TTS", "true").strip().lower() in {"1", "true", "yes", "on"}
-
-# If you want “barge-in” (user talking interrupts TTS), set true.
-BARGE_IN = os.getenv("BARGE_IN", "false").strip().lower() in {"1", "true", "yes", "on"}
+API_HOST = os.getenv("API_HOST", "0.0.0.0")
+API_PORT = int(os.getenv("API_PORT", "8080"))
+WHISPER_MODEL_PATH = os.getenv("WHISPER_MODEL_PATH", "models/ggml-base.en.bin")
+WHISPER_COMMAND = os.getenv(
+    "WHISPER_COMMAND",
+    'whisper-cli -m "{whisper_model_path}" -f "{audio_path}" -otxt -of "{out_prefix}"',
+)
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
+OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", "http://127.0.0.1:11434")
+SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "You are a concise assistant.")
+CONTEXT_WINDOW_TURNS = int(os.getenv("CONTEXT_WINDOW_TURNS", "6"))
+DEFAULT_SESSION_ID = os.getenv("DEFAULT_SESSION_ID", "default")
 
 
-# ==========================
-# TTS Worker (safe, thread-owned)
-# ==========================
-class TTSWorker:
-    """
-    Thread-owned pyttsx3 engine.
-    - speaking Event allows client to duck mic while TTS plays
-    - stop() sends a stop command processed in the same thread
-    - chunking avoids long runAndWait hangs
-    """
+async def run_cmd(command: str) -> tuple[int, str, str]:
+    proc = await asyncio.create_subprocess_shell(
+        command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    return proc.returncode, stdout.decode("utf-8", errors="ignore"), stderr.decode(
+        "utf-8", errors="ignore"
+    )
 
-    def __init__(self, rate: int = 185, voice_hint: str = "", max_chunk_chars: int = 220):
-        self._rate = rate
-        self._voice_hint = (voice_hint or "").strip().lower()
-        self._max_chunk_chars = max_chunk_chars
 
-        # queue items:
-        #   ("say", text, seq)
-        #   ("stop", "", seq)
-        #   None -> shutdown
-        self._q: queue.Queue[tuple[str, str, int] | None] = queue.Queue()
-        self._seq = 0
-        self._lock = threading.Lock()
+def build_prompt(history: list[tuple[str, str]], user_text: str) -> str:
+    prompt_lines = [SYSTEM_PROMPT, ""]
+    for old_user, old_assistant in history:
+        prompt_lines.append(f"User: {old_user}")
+        prompt_lines.append(f"Assistant: {old_assistant}")
+    prompt_lines.append(f"User: {user_text}")
+    prompt_lines.append("Assistant:")
+    return "\n".join(prompt_lines)
 
-        self.speaking = threading.Event()
 
-        self._thread = threading.Thread(target=self._run, name="tts-worker", daemon=True)
-        self._thread.start()
+async def transcribe(audio_path: Path, workdir: Path) -> str:
+    out_prefix = workdir / "stt_output"
+    cmd = WHISPER_COMMAND.format(
+        audio_path=audio_path,
+        out_prefix=out_prefix,
+        whisper_model_path=WHISPER_MODEL_PATH,
+        workdir=workdir,
+    )
+    code, out, err = await run_cmd(cmd)
+    if code != 0:
+        model_msg = ""
+        if "failed to open" in err.lower() or "no such file" in err.lower():
+            model_msg = (
+                f" (check WHISPER_MODEL_PATH='{WHISPER_MODEL_PATH}' on the remote server)"
+            )
+        raise RuntimeError(f"transcription failed: {err.strip()}{model_msg}")
 
-    def speak_now(self, text: str) -> None:
-        text = (text or "").strip()
-        if not text:
-            return
-        with self._lock:
-            self._seq += 1
-            seq = self._seq
-        self._q.put(("say", text, seq))
+    txt_path = Path(f"{out_prefix}.txt")
+    if txt_path.exists():
+        return txt_path.read_text(encoding="utf-8").strip()
+    transcript = out.strip()
+    if transcript:
+        return transcript
+    raise RuntimeError("transcription output file not found and stdout was empty")
 
-    def stop(self) -> None:
-        with self._lock:
-            self._seq += 1
-            seq = self._seq
-        self._q.put(("stop", "", seq))
 
-    def close(self) -> None:
-        self._q.put(None)
+async def run_llm_once(prompt: str) -> str:
+    url = f"{OLLAMA_API_URL.rstrip('/')}/api/generate"
+    payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False}
+    async with ClientSession() as session:
+        async with session.post(url, json=payload) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise RuntimeError(f"llm failed with {resp.status}: {text}")
+            data = await resp.json()
+    if data.get("error"):
+        raise RuntimeError(f"llm failed: {data['error']}")
+    return str(data.get("response", "")).strip()
 
-    def join(self, timeout: float = 2.0) -> None:
-        self._thread.join(timeout)
 
-    def _build_engine(self) -> pyttsx3.Engine:
-        eng = pyttsx3.init()
-        eng.setProperty("rate", self._rate)
-
-        if self._voice_hint:
-            try:
-                for v in eng.getProperty("voices"):
-                    blob = f"{getattr(v,'id','')} {getattr(v,'name','')}".lower()
-                    if self._voice_hint in blob:
-                        eng.setProperty("voice", v.id)
-                        break
-            except Exception:
-                pass
-        return eng
-
-    def _split_chunks(self, text: str) -> list[str]:
-        pieces = [p.strip() for p in re.split(r"(?<=[.!?])\s+|\n+", text) if p.strip()]
-        chunks: list[str] = []
-        for piece in pieces:
-            if len(piece) <= self._max_chunk_chars:
-                chunks.append(piece)
-                continue
-            start = 0
-            while start < len(piece):
-                end = min(start + self._max_chunk_chars, len(piece))
-                chunk = piece[start:end].strip()
-                if chunk:
-                    chunks.append(chunk)
-                start = end
-        return chunks or [text[: self._max_chunk_chars].strip()]
-
-    def _run(self) -> None:
-        engine: Optional[pyttsx3.Engine] = None
-
-        while True:
-            item = self._q.get()
-            if item is None:
-                try:
-                    if engine:
-                        engine.stop()
-                except Exception:
-                    pass
-                return
-
-            cmd, text, my_seq = item
-
-            # Create engine inside this thread (thread-affinity)
-            if engine is None:
-                try:
-                    engine = self._build_engine()
-                except Exception as exc:
-                    print(f"TTS init failed: {exc}")
-                    time.sleep(0.2)
-                    engine = None
+async def run_llm_stream(prompt: str):
+    url = f"{OLLAMA_API_URL.rstrip('/')}/api/generate"
+    payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": True}
+    async with ClientSession() as session:
+        async with session.post(url, json=payload) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise RuntimeError(f"llm failed with {resp.status}: {text}")
+            async for raw_line in resp.content:
+                line = raw_line.decode("utf-8", errors="ignore").strip()
+                if not line:
                     continue
-
-            # Always try to stop queued speech before commands
-            try:
-                engine.stop()
-            except Exception:
-                pass
-
-            if cmd == "stop":
-                self.speaking.clear()
-                continue
-
-            # cmd == "say"
-            try:
-                for chunk in self._split_chunks(text):
-                    # If superseded, stop early
-                    with self._lock:
-                        if my_seq != self._seq:
-                            break
-                    self.speaking.set()
-                    engine.say(chunk)
-                    engine.runAndWait()
-                self.speaking.clear()
-            except Exception as exc:
-                self.speaking.clear()
-                print(f"TTS error (restarting engine): {exc}")
                 try:
-                    engine.stop()
-                except Exception:
-                    pass
-                engine = None
-                time.sleep(0.2)
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if data.get("error"):
+                    raise RuntimeError(f"llm failed: {data['error']}")
+                token = str(data.get("response", ""))
+                if token:
+                    yield token
+                if data.get("done"):
+                    break
 
 
-# ==========================
-# Helpers
-# ==========================
-def pcm_to_wav_bytes(pcm_frames: list[bytes], sample_rate: int) -> bytes:
-    buffer = io.BytesIO()
-    with wave.open(buffer, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)  # int16
-        wf.setframerate(sample_rate)
-        for frame in pcm_frames:
-            wf.writeframes(frame)
-    return buffer.getvalue()
+async def parse_audio_request(request: web.Request) -> tuple[str, bytes]:
+    reader = await request.multipart()
+    session_id = DEFAULT_SESSION_ID
+    audio_bytes = b""
+
+    while True:
+        part = await reader.next()
+        if part is None:
+            break
+        if part.name == "session_id":
+            session_id = (await part.text()).strip() or DEFAULT_SESSION_ID
+        elif part.name == "audio":
+            chunks = []
+            while True:
+                chunk = await part.read_chunk()
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            audio_bytes = b"".join(chunks)
+
+    if not audio_bytes:
+        raise web.HTTPBadRequest(
+            text=json.dumps({"error": "missing 'audio' file field"}),
+            content_type="application/json",
+        )
+    return session_id, audio_bytes
 
 
-def rms_int16(frame: bytes) -> int:
-    if not frame:
-        return 0
-    samples = array("h")
-    samples.frombytes(frame)
-    if not samples:
-        return 0
-    total = 0.0
-    for s in samples:
-        total += float(s) * float(s)
-    return int((total / len(samples)) ** 0.5)
+def get_history(app: web.Application, session_id: str) -> deque[tuple[str, str]]:
+    histories: dict[str, deque[tuple[str, str]]] = app["histories"]
+    return histories.setdefault(session_id, deque(maxlen=max(1, CONTEXT_WINDOW_TURNS)))
 
 
-async def send_wav_bytes_stream(session: aiohttp.ClientSession, wav_bytes: bytes) -> tuple[str, str]:
-    """
-    Robust SSE parser:
-    - resp.content yields arbitrary chunks; buffer until \n\n (SSE event separator)
-    """
-    data = aiohttp.FormData()
-    data.add_field("audio", wav_bytes, filename="input.wav", content_type="audio/wav")
-    data.add_field("session_id", SESSION_ID)
+async def chat_handler(request: web.Request) -> web.Response:
+    try:
+        session_id, audio_bytes = await parse_audio_request(request)
+    except web.HTTPException as exc:
+        return web.Response(
+            status=exc.status, text=exc.text, content_type=exc.content_type
+        )
 
-    transcript = ""
-    response_chunks: list[str] = []
-
-    timeout = aiohttp.ClientTimeout(total=180, sock_read=180)
-
-    async with session.post(REMOTE_STREAM_API_URL, data=data, timeout=timeout) as resp:
-        if resp.status != 200:
-            body = await resp.text()
-            raise RuntimeError(f"server returned {resp.status}: {body}")
-
-        print("\nAssistant (stream): ", end="", flush=True)
-
-        buf = b""
-        async for chunk in resp.content.iter_any():
-            buf += chunk
-            while b"\n\n" in buf:
-                event_bytes, buf = buf.split(b"\n\n", 1)
-
-                for raw_line in event_bytes.split(b"\n"):
-                    line = raw_line.decode("utf-8", errors="ignore").strip()
-                    if not line.startswith("data:"):
-                        continue
-                    payload = line[5:].lstrip()
-
-                    try:
-                        event = json.loads(payload)
-                    except json.JSONDecodeError:
-                        continue
-
-                    t = event.get("type")
-                    if t == "transcript":
-                        transcript = event.get("text", "")
-                    elif t == "token":
-                        tok = event.get("text", "")
-                        if tok:
-                            response_chunks.append(tok)
-                            print(tok, end="", flush=True)
-                    elif t == "error":
-                        raise RuntimeError(event.get("error", "unknown stream error"))
-                    elif t == "done":
-                        print()
-                        return transcript, "".join(response_chunks).strip()
-
-    print()
-    return transcript, "".join(response_chunks).strip()
-
-
-# ==========================
-# Main realtime loop
-# ==========================
-async def main() -> None:
-    print(f"Remote stream API: {REMOTE_STREAM_API_URL}")
-    print(f"Session ID: {SESSION_ID}")
-    print("Realtime mode enabled. Press Ctrl+C to stop.")
-    print(f"TTS: {'enabled' if TTS_ENABLED else 'disabled'}")
-    print(f"DUCK_MIC_WHILE_TTS: {DUCK_MIC_WHILE_TTS}")
-    print(f"BARGE_IN: {BARGE_IN}")
-
-    block_size = max(1, int(SAMPLE_RATE * BLOCK_MS / 1000))
-    min_speech_blocks = max(1, int(MIN_SPEECH_SECONDS * 1000 / BLOCK_MS))
-    silence_blocks_to_end = max(1, int(SILENCE_SECONDS * 1000 / BLOCK_MS))
-    pre_roll_blocks = max(0, int(PRE_ROLL_SECONDS * 1000 / BLOCK_MS))
-    max_utterance_blocks = max(1, int(MAX_UTTERANCE_SECONDS * 1000 / BLOCK_MS))
-
-    audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=400)
-    state = {"paused": False}
-
-    tts_worker = TTSWorker(rate=TTS_RATE, voice_hint=TTS_VOICE_HINT) if TTS_ENABLED else None
-
-    def callback(indata, frames, t, status):
-        if status:
-            print(f"Audio warning: {status}")
-
-        # Pause capture while sending to server
-        if state["paused"]:
-            return
-
-        # Duck mic while TTS speaks (prevents feedback from triggering VAD)
-        if DUCK_MIC_WHILE_TTS and tts_worker and tts_worker.speaking.is_set():
-            return
+    with tempfile.TemporaryDirectory() as td:
+        workdir = Path(td)
+        audio_path = workdir / "input.wav"
+        audio_path.write_bytes(audio_bytes)
 
         try:
-            audio_queue.put_nowait(bytes(indata))
-        except queue.Full:
-            pass
+            transcript = await transcribe(audio_path, workdir)
+            history = get_history(request.app, session_id)
+            prompt = build_prompt(list(history), transcript)
+            response_text = await run_llm_once(prompt)
+            history.append((transcript, response_text))
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=500)
 
-    # VAD / utterance state
-    in_speech = False
-    speech_blocks = 0
-    silence_blocks = 0
-    pre_roll: deque[bytes] = deque(maxlen=pre_roll_blocks)
-    utterance_frames: list[bytes] = []
-    utterance_blocks = 0
+    return web.json_response(
+        {"transcript": transcript, "response": response_text, "session_id": session_id}
+    )
 
-    def reset_utterance_state() -> None:
-        nonlocal in_speech, speech_blocks, silence_blocks, utterance_frames, utterance_blocks
-        in_speech = False
-        speech_blocks = 0
-        silence_blocks = 0
-        utterance_blocks = 0
-        pre_roll.clear()
-        utterance_frames = []
-        # drop old queued audio to avoid “backlog speaking”
-        while not audio_queue.empty():
-            try:
-                audio_queue.get_nowait()
-            except queue.Empty:
-                break
 
+async def chat_stream_handler(request: web.Request) -> web.StreamResponse:
     try:
-        async with aiohttp.ClientSession() as http_session:
-            with sd.RawInputStream(
-                samplerate=SAMPLE_RATE,
-                blocksize=block_size,
-                channels=1,
-                dtype="int16",
-                callback=callback,
-            ):
-                while True:
-                    frame = await asyncio.to_thread(audio_queue.get)
-                    rms = rms_int16(frame)
-                    voiced = rms >= RMS_THRESHOLD
+        session_id, audio_bytes = await parse_audio_request(request)
+    except web.HTTPException as exc:
+        return web.Response(
+            status=exc.status, text=exc.text, content_type=exc.content_type
+        )
 
-                    if not in_speech:
-                        pre_roll.append(frame)
-                        if voiced:
-                            in_speech = True
-                            speech_blocks = 1
-                            silence_blocks = 0
-                            utterance_blocks = len(pre_roll)
-                            utterance_frames = list(pre_roll)
+    resp = web.StreamResponse(
+        status=200,
+        headers={
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )
+    await resp.prepare(request)
 
-                            # Optional: barge-in stops TTS, but only on real entry into speech
-                            if BARGE_IN and tts_worker:
-                                tts_worker.stop()
-                        continue
+    with tempfile.TemporaryDirectory() as td:
+        workdir = Path(td)
+        audio_path = workdir / "input.wav"
+        audio_path.write_bytes(audio_bytes)
 
-                    utterance_frames.append(frame)
-                    utterance_blocks += 1
+        try:
+            transcript = await transcribe(audio_path, workdir)
+            await resp.write(
+                f"data: {json.dumps({'type': 'transcript', 'text': transcript})}\n\n".encode(
+                    "utf-8"
+                )
+            )
 
-                    if voiced:
-                        speech_blocks += 1
-                        silence_blocks = 0
-                    else:
-                        silence_blocks += 1
+            history = get_history(request.app, session_id)
+            prompt = build_prompt(list(history), transcript)
+            chunks: list[str] = []
+            async for chunk in run_llm_stream(prompt):
+                chunks.append(chunk)
+                await resp.write(
+                    f"data: {json.dumps({'type': 'token', 'text': chunk})}\n\n".encode(
+                        "utf-8"
+                    )
+                )
 
-                    enough_voice = speech_blocks >= min_speech_blocks
-                    end_of_utterance = silence_blocks >= silence_blocks_to_end
-                    force_end = utterance_blocks >= max_utterance_blocks
+            response_text = "".join(chunks).strip()
+            history.append((transcript, response_text))
+            await resp.write(
+                f"data: {json.dumps({'type': 'done', 'session_id': session_id})}\n\n".encode(
+                    "utf-8"
+                )
+            )
+        except Exception as exc:
+            await resp.write(
+                f"data: {json.dumps({'type': 'error', 'error': str(exc)})}\n\n".encode(
+                    "utf-8"
+                )
+            )
 
-                    if end_of_utterance or force_end:
-                        if enough_voice:
-                            wav_bytes = pcm_to_wav_bytes(utterance_frames, SAMPLE_RATE)
-                            state["paused"] = True
-                            try:
-                                transcript, response = await send_wav_bytes_stream(http_session, wav_bytes)
-                                print(f"You said: {transcript}")
+    await resp.write_eof()
+    return resp
 
-                                if tts_worker and response:
-                                    tts_worker.speak_now(response)
-                            except Exception as exc:
-                                print(f"\nError: {exc}")
-                            finally:
-                                state["paused"] = False
 
-                        reset_utterance_state()
-
-    finally:
-        if tts_worker:
-            tts_worker.close()
-            await asyncio.to_thread(tts_worker.join, 2.0)
+def main() -> None:
+    app = web.Application(client_max_size=10 * 1024 * 1024)
+    app["histories"] = {}
+    app.router.add_post("/chat", chat_handler)
+    app.router.add_post("/chat/stream", chat_stream_handler)
+    web.run_app(app, host=API_HOST, port=API_PORT)
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\nStopped.")
-        raise SystemExit(0)
+    main()
