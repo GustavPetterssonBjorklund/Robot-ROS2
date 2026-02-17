@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import shlex
 import tempfile
@@ -36,6 +37,16 @@ async def run_cmd(command: str) -> tuple[int, str, str]:
     )
 
 
+def build_prompt(history: list[tuple[str, str]], user_text: str) -> str:
+    prompt_lines = [SYSTEM_PROMPT, ""]
+    for old_user, old_assistant in history:
+        prompt_lines.append(f"User: {old_user}")
+        prompt_lines.append(f"Assistant: {old_assistant}")
+    prompt_lines.append(f"User: {user_text}")
+    prompt_lines.append("Assistant:")
+    return "\n".join(prompt_lines)
+
+
 async def transcribe(audio_path: Path, workdir: Path) -> str:
     out_prefix = workdir / "stt_output"
     cmd = WHISPER_COMMAND.format(
@@ -44,7 +55,7 @@ async def transcribe(audio_path: Path, workdir: Path) -> str:
         whisper_model_path=WHISPER_MODEL_PATH,
         workdir=workdir,
     )
-    code, _, err = await run_cmd(cmd)
+    code, out, err = await run_cmd(cmd)
     if code != 0:
         model_msg = ""
         if "failed to open" in err.lower() or "no such file" in err.lower():
@@ -54,19 +65,15 @@ async def transcribe(audio_path: Path, workdir: Path) -> str:
         raise RuntimeError(f"transcription failed: {err.strip()}{model_msg}")
 
     txt_path = Path(f"{out_prefix}.txt")
-    if not txt_path.exists():
-        raise RuntimeError("transcription output file not found")
-    return txt_path.read_text(encoding="utf-8").strip()
+    if txt_path.exists():
+        return txt_path.read_text(encoding="utf-8").strip()
+    transcript = out.strip()
+    if transcript:
+        return transcript
+    raise RuntimeError("transcription output file not found and stdout was empty")
 
 
-async def run_llm(history: list[tuple[str, str]], user_text: str) -> str:
-    prompt_lines = [SYSTEM_PROMPT, ""]
-    for old_user, old_assistant in history:
-        prompt_lines.append(f"User: {old_user}")
-        prompt_lines.append(f"Assistant: {old_assistant}")
-    prompt_lines.append(f"User: {user_text}")
-    prompt_lines.append("Assistant:")
-    prompt = "\n".join(prompt_lines)
+async def run_llm_once(prompt: str) -> str:
     cmd = f"ollama run {shlex.quote(OLLAMA_MODEL)} {shlex.quote(prompt)}"
     code, out, err = await run_cmd(cmd)
     if code != 0:
@@ -74,7 +81,32 @@ async def run_llm(history: list[tuple[str, str]], user_text: str) -> str:
     return out.strip()
 
 
-async def chat_handler(request: web.Request) -> web.Response:
+async def run_llm_stream(prompt: str):
+    proc = await asyncio.create_subprocess_exec(
+        "ollama",
+        "run",
+        OLLAMA_MODEL,
+        prompt,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    assert proc.stdout is not None
+    assert proc.stderr is not None
+
+    while True:
+        chunk = await proc.stdout.read(64)
+        if not chunk:
+            break
+        yield chunk.decode("utf-8", errors="ignore")
+
+    stderr_bytes = await proc.stderr.read()
+    return_code = await proc.wait()
+    if return_code != 0:
+        err = stderr_bytes.decode("utf-8", errors="ignore").strip()
+        raise RuntimeError(f"llm failed: {err}")
+
+
+async def parse_audio_request(request: web.Request) -> tuple[str, bytes]:
     reader = await request.multipart()
     session_id = DEFAULT_SESSION_ID
     audio_bytes = b""
@@ -95,34 +127,106 @@ async def chat_handler(request: web.Request) -> web.Response:
             audio_bytes = b"".join(chunks)
 
     if not audio_bytes:
-        return web.json_response({"error": "missing 'audio' file field"}, status=400)
+        raise web.HTTPBadRequest(
+            text=json.dumps({"error": "missing 'audio' file field"}),
+            content_type="application/json",
+        )
+    return session_id, audio_bytes
+
+
+def get_history(app: web.Application, session_id: str) -> deque[tuple[str, str]]:
+    histories: dict[str, deque[tuple[str, str]]] = app["histories"]
+    return histories.setdefault(session_id, deque(maxlen=max(1, CONTEXT_WINDOW_TURNS)))
+
+
+async def chat_handler(request: web.Request) -> web.Response:
+    try:
+        session_id, audio_bytes = await parse_audio_request(request)
+    except web.HTTPException as exc:
+        return web.Response(status=exc.status, text=exc.text, content_type=exc.content_type)
 
     with tempfile.TemporaryDirectory() as td:
         workdir = Path(td)
         audio_path = workdir / "input.wav"
-        with audio_path.open("wb") as f:
-            f.write(audio_bytes)
+        audio_path.write_bytes(audio_bytes)
 
         try:
             transcript = await transcribe(audio_path, workdir)
-            histories: dict[str, deque[tuple[str, str]]] = request.app["histories"]
-            history = histories.setdefault(
-                session_id, deque(maxlen=max(1, CONTEXT_WINDOW_TURNS))
-            )
-            response_text = await run_llm(list(history), transcript)
+            history = get_history(request.app, session_id)
+            prompt = build_prompt(list(history), transcript)
+            response_text = await run_llm_once(prompt)
             history.append((transcript, response_text))
         except Exception as exc:
             return web.json_response({"error": str(exc)}, status=500)
 
-        return web.json_response(
-            {"transcript": transcript, "response": response_text, "session_id": session_id}
-        )
+    return web.json_response(
+        {"transcript": transcript, "response": response_text, "session_id": session_id}
+    )
+
+
+async def chat_stream_handler(request: web.Request) -> web.StreamResponse:
+    try:
+        session_id, audio_bytes = await parse_audio_request(request)
+    except web.HTTPException as exc:
+        return web.Response(status=exc.status, text=exc.text, content_type=exc.content_type)
+
+    resp = web.StreamResponse(
+        status=200,
+        headers={
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )
+    await resp.prepare(request)
+
+    with tempfile.TemporaryDirectory() as td:
+        workdir = Path(td)
+        audio_path = workdir / "input.wav"
+        audio_path.write_bytes(audio_bytes)
+
+        try:
+            transcript = await transcribe(audio_path, workdir)
+            await resp.write(
+                f"data: {json.dumps({'type': 'transcript', 'text': transcript})}\n\n".encode(
+                    "utf-8"
+                )
+            )
+
+            history = get_history(request.app, session_id)
+            prompt = build_prompt(list(history), transcript)
+            chunks: list[str] = []
+            async for chunk in run_llm_stream(prompt):
+                chunks.append(chunk)
+                await resp.write(
+                    f"data: {json.dumps({'type': 'token', 'text': chunk})}\n\n".encode(
+                        "utf-8"
+                    )
+                )
+
+            response_text = "".join(chunks).strip()
+            history.append((transcript, response_text))
+            await resp.write(
+                f"data: {json.dumps({'type': 'done', 'session_id': session_id})}\n\n".encode(
+                    "utf-8"
+                )
+            )
+        except Exception as exc:
+            await resp.write(
+                f"data: {json.dumps({'type': 'error', 'error': str(exc)})}\n\n".encode(
+                    "utf-8"
+                )
+            )
+
+    await resp.write_eof()
+    return resp
 
 
 def main() -> None:
     app = web.Application(client_max_size=10 * 1024 * 1024)
     app["histories"] = {}
     app.router.add_post("/chat", chat_handler)
+    app.router.add_post("/chat/stream", chat_stream_handler)
     web.run_app(app, host=API_HOST, port=API_PORT)
 
 

@@ -1,6 +1,7 @@
 import asyncio
 import audioop
 import io
+import json
 import os
 import queue
 import wave
@@ -15,6 +16,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 REMOTE_API_URL = os.getenv("REMOTE_API_URL", "http://127.0.0.1:8080/chat")
+REMOTE_STREAM_API_URL = os.getenv(
+    "REMOTE_STREAM_API_URL", REMOTE_API_URL.rstrip("/") + "/stream"
+)
 SESSION_ID = os.getenv("SESSION_ID", "default")
 SAMPLE_RATE = int(os.getenv("SAMPLE_RATE", "16000"))
 BLOCK_MS = int(os.getenv("REALTIME_BLOCK_MS", "30"))
@@ -59,15 +63,44 @@ async def speak_text(engine: pyttsx3.Engine | None, text: str) -> None:
         print(f"TTS error: {exc}")
 
 
-async def send_wav_bytes(session: aiohttp.ClientSession, wav_bytes: bytes) -> dict:
+async def send_wav_bytes_stream(session: aiohttp.ClientSession, wav_bytes: bytes) -> tuple[str, str]:
     data = aiohttp.FormData()
     data.add_field("audio", wav_bytes, filename="input.wav", content_type="audio/wav")
     data.add_field("session_id", SESSION_ID)
-    async with session.post(REMOTE_API_URL, data=data) as resp:
-        payload = await resp.json()
+
+    transcript = ""
+    response_chunks: list[str] = []
+
+    async with session.post(REMOTE_STREAM_API_URL, data=data) as resp:
         if resp.status != 200:
-            raise RuntimeError(payload.get("error", f"server returned {resp.status}"))
-        return payload
+            body = await resp.text()
+            raise RuntimeError(f"server returned {resp.status}: {body}")
+
+        print("\nAssistant (stream): ", end="", flush=True)
+        async for raw_line in resp.content:
+            line = raw_line.decode("utf-8", errors="ignore").strip()
+            if not line.startswith("data: "):
+                continue
+
+            try:
+                event = json.loads(line[6:])
+            except json.JSONDecodeError:
+                continue
+
+            event_type = event.get("type")
+            if event_type == "transcript":
+                transcript = event.get("text", "")
+            elif event_type == "token":
+                token = event.get("text", "")
+                response_chunks.append(token)
+                print(token, end="", flush=True)
+            elif event_type == "error":
+                raise RuntimeError(event.get("error", "unknown stream error"))
+            elif event_type == "done":
+                break
+
+    print()
+    return transcript, "".join(response_chunks).strip()
 
 
 def pcm_to_wav_bytes(pcm_frames: list[bytes], sample_rate: int) -> bytes:
@@ -82,7 +115,7 @@ def pcm_to_wav_bytes(pcm_frames: list[bytes], sample_rate: int) -> bytes:
 
 
 async def main() -> None:
-    print(f"Remote API: {REMOTE_API_URL}")
+    print(f"Remote stream API: {REMOTE_STREAM_API_URL}")
     print(f"Session ID: {SESSION_ID}")
     print("Realtime mode enabled. Press Ctrl+C to stop.")
     print(f"TTS: {'enabled' if TTS_ENABLED else 'disabled'}")
@@ -92,12 +125,18 @@ async def main() -> None:
     silence_blocks_to_end = max(1, int(SILENCE_SECONDS * 1000 / BLOCK_MS))
     pre_roll_blocks = max(0, int(PRE_ROLL_SECONDS * 1000 / BLOCK_MS))
 
-    audio_queue: queue.Queue[bytes] = queue.Queue()
+    audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=300)
+    state = {"paused": False}
 
     def callback(indata, frames, time, status):
         if status:
             print(f"Audio warning: {status}")
-        audio_queue.put(bytes(indata))
+        if state["paused"]:
+            return
+        try:
+            audio_queue.put_nowait(bytes(indata))
+        except queue.Full:
+            pass
 
     in_speech = False
     speech_blocks = 0
@@ -105,6 +144,19 @@ async def main() -> None:
     pre_roll: deque[bytes] = deque(maxlen=pre_roll_blocks)
     utterance_frames: list[bytes] = []
     tts_engine = init_tts_engine()
+
+    def reset_utterance_state() -> None:
+        nonlocal in_speech, speech_blocks, silence_blocks, utterance_frames
+        in_speech = False
+        speech_blocks = 0
+        silence_blocks = 0
+        pre_roll.clear()
+        utterance_frames = []
+        while not audio_queue.empty():
+            try:
+                audio_queue.get_nowait()
+            except queue.Empty:
+                break
 
     async with aiohttp.ClientSession() as http_session:
         with sd.RawInputStream(
@@ -137,23 +189,19 @@ async def main() -> None:
 
                 enough_voice = speech_blocks >= min_speech_blocks
                 end_of_utterance = silence_blocks >= silence_blocks_to_end
-                if enough_voice and end_of_utterance:
-                    wav_bytes = pcm_to_wav_bytes(utterance_frames, SAMPLE_RATE)
-                    try:
-                        result = await send_wav_bytes(http_session, wav_bytes)
-                        transcript = result.get("transcript", "")
-                        response = result.get("response", "")
-                        print(f"\nYou said: {transcript}")
-                        print(f"Assistant: {response}\n")
-                        await speak_text(tts_engine, response)
-                    except Exception as exc:
-                        print(f"Error: {exc}")
-
-                    in_speech = False
-                    speech_blocks = 0
-                    silence_blocks = 0
-                    pre_roll.clear()
-                    utterance_frames = []
+                if end_of_utterance:
+                    if enough_voice:
+                        wav_bytes = pcm_to_wav_bytes(utterance_frames, SAMPLE_RATE)
+                        state["paused"] = True
+                        try:
+                            transcript, response = await send_wav_bytes_stream(http_session, wav_bytes)
+                            print(f"You said: {transcript}")
+                            await speak_text(tts_engine, response)
+                        except Exception as exc:
+                            print(f"\nError: {exc}")
+                        finally:
+                            state["paused"] = False
+                    reset_utterance_state()
 
 
 if __name__ == "__main__":
@@ -161,4 +209,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nStopped.")
-        exit(0)
+        raise SystemExit(0)

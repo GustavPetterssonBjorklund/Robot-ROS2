@@ -4,7 +4,9 @@ Simple voice-to-text + remote LLM text response demo, with your own async API.
 
 ## Architecture
 1. `server.py` runs on your remote server.
-2. It exposes an async HTTP API (`aiohttp`) endpoint: `POST /chat`.
+2. It exposes async HTTP API (`aiohttp`) endpoints:
+- `POST /chat` (non-streaming)
+- `POST /chat/stream` (SSE token streaming)
 3. The server runs:
 - STT using `whisper-cli` (or equivalent command you configure).
 - LLM response using `ollama run` (or equivalent command you configure).
@@ -13,7 +15,7 @@ Simple voice-to-text + remote LLM text response demo, with your own async API.
 - continuously listens to microphone input
 - auto-detects speech/silence
 - sends each utterance to the remote API
-- prints transcript + LLM response
+- prints transcript + streamed LLM tokens in realtime
 - plays the LLM response with TTS
 
 No external hosted API is required.
@@ -80,6 +82,7 @@ Useful client tuning env vars:
 - `REALTIME_SILENCE_SECONDS`: silence required before sending an utterance.
 - `REALTIME_MIN_SPEECH_SECONDS`: minimum speech duration to accept an utterance.
 - `REALTIME_BLOCK_MS`: capture block size in ms.
+- `REMOTE_STREAM_API_URL`: streaming endpoint (SSE).
 - `SESSION_ID`: conversation id used for server-side context memory.
 - `TTS_ENABLED`: enable/disable response speech.
 - `TTS_RATE`: text-to-speech speaking rate.
@@ -101,3 +104,10 @@ Response JSON:
   "response": "assistant text"
 }
 ```
+
+`POST /chat/stream` (multipart, SSE):
+- fields: same as `/chat`
+- SSE `data` events:
+  - `{"type":"transcript","text":"..."}`
+  - `{"type":"token","text":"..."}`
+  - `{"type":"done","session_id":"..."}`
