@@ -16,7 +16,7 @@ Simple voice-to-text + remote LLM text response demo, with your own async API.
 - auto-detects speech/silence
 - sends each utterance to the remote API
 - prints transcript + streamed LLM tokens in realtime
-- plays the LLM response with TTS
+- requests WAV TTS from the remote API and plays it locally
 
 No external hosted API is required.
 
@@ -84,15 +84,17 @@ Useful client tuning env vars:
 - `REALTIME_BLOCK_MS`: capture block size in ms.
 - `REALTIME_MAX_UTTERANCE_SECONDS`: force-close an utterance if silence is never detected.
 - `REMOTE_STREAM_API_URL`: streaming endpoint (SSE).
+- `REMOTE_TTS_API_URL`: server endpoint for synthesized WAV (`POST /tts`).
 - `SESSION_ID`: conversation id used for server-side context memory.
 - `TTS_ENABLED`: enable/disable response speech.
-- `TTS_RATE`: text-to-speech speaking rate.
-- `TTS_VOICE_HINT`: optional substring to pick a voice by id/name.
+- `DUCK_MIC_WHILE_PLAYBACK`: pause mic capture while response audio is playing.
 
 Useful server context env vars:
 - `CONTEXT_WINDOW_TURNS`: number of previous user/assistant turns kept per session.
 - `DEFAULT_SESSION_ID`: fallback session id when the client does not provide one.
 - `OLLAMA_API_URL`: local Ollama server URL (default `http://127.0.0.1:11434`).
+- `TTS_RATE`: speaking rate placeholder passed to `TTS_COMMAND`.
+- `TTS_COMMAND`: command that writes WAV to stdout (default: `espeak-ng -s {rate} --stdout {text}`).
 
 ## API contract
 `POST /chat` (multipart):
@@ -113,3 +115,7 @@ Response JSON:
   - `{"type":"transcript","text":"..."}`
   - `{"type":"token","text":"..."}`
   - `{"type":"done","session_id":"..."}`
+
+`POST /tts` (json):
+- request: `{"text":"..."}`
+- response: `audio/wav` bytes

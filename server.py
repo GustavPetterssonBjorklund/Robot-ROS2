@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import shlex
 import tempfile
 from collections import deque
 from pathlib import Path
@@ -23,6 +24,12 @@ OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", "http://127.0.0.1:11434")
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "You are a concise assistant.")
 CONTEXT_WINDOW_TURNS = int(os.getenv("CONTEXT_WINDOW_TURNS", "6"))
 DEFAULT_SESSION_ID = os.getenv("DEFAULT_SESSION_ID", "default")
+TTS_ENABLED = os.getenv("TTS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+TTS_RATE = int(os.getenv("TTS_RATE", "185"))
+TTS_COMMAND = os.getenv(
+    "TTS_COMMAND",
+    "espeak-ng -s {rate} --stdout {text}",
+)
 
 
 async def run_cmd(command: str) -> tuple[int, str, str]:
@@ -35,6 +42,16 @@ async def run_cmd(command: str) -> tuple[int, str, str]:
     return proc.returncode, stdout.decode("utf-8", errors="ignore"), stderr.decode(
         "utf-8", errors="ignore"
     )
+
+
+async def run_cmd_bytes(command: str) -> tuple[int, bytes, bytes]:
+    proc = await asyncio.create_subprocess_shell(
+        command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    return proc.returncode, stdout, stderr
 
 
 def build_prompt(history: list[tuple[str, str]], user_text: str) -> str:
@@ -110,6 +127,25 @@ async def run_llm_stream(prompt: str):
                     yield token
                 if data.get("done"):
                     break
+
+
+async def synthesize_tts_wav(text: str) -> bytes:
+    if not TTS_ENABLED:
+        raise RuntimeError("tts is disabled")
+    t = (text or "").strip()
+    if not t:
+        raise RuntimeError("text is empty")
+    cmd = TTS_COMMAND.format(
+        text=shlex.quote(t),
+        rate=TTS_RATE,
+    )
+    code, out, err = await run_cmd_bytes(cmd)
+    if code != 0:
+        stderr = err.decode("utf-8", errors="ignore").strip()
+        raise RuntimeError(f"tts failed: {stderr or 'unknown error'}")
+    if not out:
+        raise RuntimeError("tts returned empty audio")
+    return out
 
 
 async def parse_audio_request(request: web.Request) -> tuple[str, bytes]:
@@ -232,11 +268,27 @@ async def chat_stream_handler(request: web.Request) -> web.StreamResponse:
     return resp
 
 
+async def tts_handler(request: web.Request) -> web.Response:
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid json body"}, status=400)
+    text = str(payload.get("text", "")).strip()
+    if not text:
+        return web.json_response({"error": "missing 'text'"}, status=400)
+    try:
+        wav_bytes = await synthesize_tts_wav(text)
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+    return web.Response(body=wav_bytes, content_type="audio/wav")
+
+
 def main() -> None:
     app = web.Application(client_max_size=10 * 1024 * 1024)
     app["histories"] = {}
     app.router.add_post("/chat", chat_handler)
     app.router.add_post("/chat/stream", chat_stream_handler)
+    app.router.add_post("/tts", tts_handler)
     web.run_app(app, host=API_HOST, port=API_PORT)
 
 
