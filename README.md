@@ -47,6 +47,18 @@ On the remote machine, install model tools (example):
 - `whisper-cli` for transcription
 - `ollama` with your model pulled (example: `ollama pull llama3.1`)
 
+Download a Whisper model on the remote machine (example):
+```bash
+mkdir -p models
+curl -L https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin -o models/ggml-base.en.bin
+```
+
+Set in `.env` on remote:
+```bash
+WHISPER_MODEL_PATH=models/ggml-base.en.bin
+WHISPER_COMMAND=whisper-cli -m "{whisper_model_path}" -f "{audio_path}" -otxt -of "{out_prefix}"
+```
+
 Configure `.env` (server section) and run on remote:
 ```bash
 python server.py

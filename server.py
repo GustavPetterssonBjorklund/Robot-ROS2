@@ -11,9 +11,10 @@ load_dotenv()
 
 API_HOST = os.getenv("API_HOST", "0.0.0.0")
 API_PORT = int(os.getenv("API_PORT", "8080"))
+WHISPER_MODEL_PATH = os.getenv("WHISPER_MODEL_PATH", "models/ggml-base.en.bin")
 WHISPER_COMMAND = os.getenv(
     "WHISPER_COMMAND",
-    'whisper-cli --model base.en --file "{audio_path}" --output-txt --output-file "{out_prefix}"',
+    'whisper-cli -m "{whisper_model_path}" -f "{audio_path}" -otxt -of "{out_prefix}"',
 )
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "You are a concise assistant.")
@@ -33,10 +34,20 @@ async def run_cmd(command: str) -> tuple[int, str, str]:
 
 async def transcribe(audio_path: Path, workdir: Path) -> str:
     out_prefix = workdir / "stt_output"
-    cmd = WHISPER_COMMAND.format(audio_path=audio_path, out_prefix=out_prefix)
+    cmd = WHISPER_COMMAND.format(
+        audio_path=audio_path,
+        out_prefix=out_prefix,
+        whisper_model_path=WHISPER_MODEL_PATH,
+        workdir=workdir,
+    )
     code, _, err = await run_cmd(cmd)
     if code != 0:
-        raise RuntimeError(f"transcription failed: {err.strip()}")
+        model_msg = ""
+        if "failed to open" in err.lower() or "no such file" in err.lower():
+            model_msg = (
+                f" (check WHISPER_MODEL_PATH='{WHISPER_MODEL_PATH}' on the remote server)"
+            )
+        raise RuntimeError(f"transcription failed: {err.strip()}{model_msg}")
 
     txt_path = Path(f"{out_prefix}.txt")
     if not txt_path.exists():
